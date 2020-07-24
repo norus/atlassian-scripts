@@ -1,0 +1,72 @@
+#!/usr/bin/env python
+import requests
+from datetime import datetime
+from slackclient import SlackClient
+import os
+
+class Slack:
+    def __init__(self, token=None, channel=None):
+        self.channel = channel
+        self.slack_client = SlackClient(token)
+
+    def notify(self, message):
+        try:
+            self.slack_client.api_call(
+                'chat.postMessage',
+                channel=self.channel,
+                text=message)
+        except Exception as e:
+            print(e)
+
+class Jira:
+    def __init__(self):
+        self.jira_url = os.environ.get('JIRA_API_URL')
+        self.jira_user = os.environ.get('JIRA_USER')
+        self.jira_pass = os.environ.get('JIRA_PASS')
+
+    def check_expired_plugins(self):
+        try:
+            plugin_r = requests.get(self.jira_url, auth=(self.jira_user, self.jira_pass))
+            plugin_details = list(filter(lambda x: x['enabled'] == True and x['usesLicensing'] == True and x['userInstalled'] == True, plugin_r.json()['plugins']))
+        except requests.exceptions.RequestException as e:
+             raise SystemExit(e)
+
+        licenses = []
+        for user_plugin in plugin_details:
+            license_r = requests.get(self.jira_url+user_plugin['key']+'-key/license', auth=(self.jira_user, self.jira_pass))
+            license_details = license_r.json()
+            if license_details['active']:
+                licenses.append(license_details)
+
+        result = []
+        for plugin, license in zip(plugin_details, licenses):
+            result.append({
+                plugin['name']: {
+                    'evaluation': license['evaluation'],
+                    'maintenanceExpired': license['maintenanceExpired'],
+                    'expiryDateString': license['expiryDateString'],
+                    'supportEntitlementNumber': license['supportEntitlementNumber'],
+                    'contactEmail': license['contactEmail']
+                }
+            })
+
+        slack_alert = []
+        today = datetime.strptime(datetime.now().strftime('%d/%b/%y'), '%d/%b/%y')
+        for res in result:
+            for k,v in res.items():
+                if v['maintenanceExpired'] or (datetime.strptime(v['expiryDateString'], '%d/%b/%y')-today).days <= 7:
+                    slack_alert.append(res)
+
+        if slack_alert:
+            slack = Slack(token=os.environ.get('SLACK_API'), channel=os.environ.get('SLACK_CHANNEL'))
+            for alert in slack_alert:
+                for k,v in alert.items():
+                    message = '*License expired or about to expire for* {} on {}\n*Evaluation:* {}\n*SEN:* {}\n*Contact:* {}'.format(k, 
+                        v['expiryDateString'],
+                        v['evaluation'],
+                        v['supportEntitlementNumber'],
+                        v['contactEmail'])
+                    slack.notify(message)
+
+c = Jira()
+c.check_expired_plugins()
